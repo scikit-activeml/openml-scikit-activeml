@@ -1,4 +1,5 @@
 from copy import deepcopy
+from timeit import repeat
 from openml.tasks.task import TaskType
 from openml.extensions.sklearn import SklearnExtension
 from openml.flows import OpenMLFlow
@@ -411,10 +412,12 @@ class SkactivemlExtension(SklearnExtension):
         for _, v in query_params.items():
             self._prevent_optimize_n_jobs(v)
 
-        self._prevent_optimize_n_jobs(query_params)
         # measures and stores runtimes
         user_defined_measures = OrderedDict()  # type: 'OrderedDict[str, float]'
         try:
+            batch_size = task.batch_size
+            if batch_size is None:
+                batch_size=1
             # for measuring runtime. Only available since Python 3.3
             modelfit_start_cputime = time.process_time()
             modelfit_start_walltime = time.time()
@@ -432,22 +435,41 @@ class SkactivemlExtension(SklearnExtension):
                     max_budget = np.inf
                 cycle = 0
                 used_budget=0
-                annotation_cost = np.full(len(y), 1)
+                annotation_costs = np.full(len(y), 1)
                 if task.annotation_costs is not None:
-                    annotation_cost = task.annotation_costs
-                max_cycles = len(y)-1
+                    train_idx = task.get_train_test_split_indices(fold=fold_no, repeat=rep_no)[0]
+                    annotation_costs = task.annotation_costs[train_idx]
+                max_cycles = (len(y)-1)/task.batch_size
                 while used_budget < max_budget and cycle < max_cycles:
-                    query_idx = query_strategy.query(X=X_train, y=y, **query_params)
-                    y[query_idx] = y_train.values[query_idx]
-                    used_budget = used_budget + annotation_cost[query_idx].item()
+                    query_idxs, utilities = query_strategy.query(X=X_train, y=y, batch_size=batch_size, return_utilities=True, **query_params)
+                    y[query_idxs] = y_train.values[query_idxs]
+                    for query_idx in query_idxs:
+                        used_budget = used_budget + annotation_costs[query_idx].item()
 
                     budget_t.append(used_budget)
-                    queries_t.append(query_idx)
+                    queries_t.append(query_idxs)
 
                     prediction_model.fit(X_train, y)
+
+                    if isinstance(prediction_model, sklearn.pipeline.Pipeline):
+                        used_estimator = prediction_model.steps[-1][-1]
+                    else:
+                        used_estimator = prediction_model
+                    if self._is_hpo_class(used_estimator):
+                        model_classes = used_estimator.best_estimator_.classes_
+                    else:
+                        model_classes = used_estimator.classes_
+
                     pred_t.append(prediction_model.predict(X_test))
                     proba_t_raw = prediction_model.predict_proba(X_test)
-                    proba_t.append(pd.DataFrame(proba_t_raw, columns=prediction_model.classes_))
+                    proba_t_df = pd.DataFrame(proba_t_raw, columns=model_classes)
+                    for _, col in enumerate(task.class_labels):
+                        # adding missing columns with 0 probability
+                        if col not in model_classes:
+                            proba_t_df[col] = 0
+                    proba_t_df = proba_t_df[task.class_labels]
+                    proba_t.append(proba_t_df)
+
                     cycle += 1
 
                 prediction_model.fit(X_train, y)
@@ -516,11 +538,8 @@ class SkactivemlExtension(SklearnExtension):
 
         if isinstance(task, OpenMLActiveClassificationTask):
 
-            try:
-                proba_y = prediction_model.predict_proba(X_test)
-                proba_y = pd.DataFrame(proba_y, columns=model_classes)  # handles X_test as numpy
-            except AttributeError:  # predict_proba is not available when probability=False
-                proba_y = _prediction_to_probabilities(pred_y, model_classes, task.class_labels)
+            proba_y = prediction_model.predict_proba(X_test)
+            proba_y = pd.DataFrame(proba_y, columns=model_classes)  # handles X_test as numpy
 
             if task.class_labels is not None:
                 if proba_y.shape[1] != len(task.class_labels):
