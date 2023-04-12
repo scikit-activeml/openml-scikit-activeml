@@ -207,6 +207,31 @@ class SkactivemlExtension(SklearnExtension):
         s = s[index1:index2]
         return s.strip()
 
+    def _get_dependencies(self) -> str:
+        import re
+        dependencies = self._min_dependency_str(sklearn.__version__)
+        # define the regular expression pattern
+        pattern = r"(scikit-learn|sklearn)\s*([>=<~!]*\d+[.\d]*)"
+
+        # substitute the version number with "new_version"
+        dependencies = re.sub(pattern, "", dependencies)
+        print(dependencies)
+        return dependencies
+
+    def _get_external_version_string(
+        self,
+        model: Any,
+        sub_components: Dict[str, OpenMLFlow],
+    ) -> str:
+        import re
+        externel_extension = super(). _get_external_version_string(model=model, sub_components=sub_components)
+        # define the regular expression pattern
+        pattern = r"(scikit-learn|sklearn)\s*([>=<~!]*\d+[.\d]*)"
+
+        # substitute the version number with "new_version"
+        externel_extension = re.sub(pattern, "", externel_extension)
+        print(externel_extension)
+        return externel_extension
 
     def _get_sklearn_description(self, model: Any, char_lim: int = 1024) -> str:
         """Fetches the sklearn function docstring for the flow description
