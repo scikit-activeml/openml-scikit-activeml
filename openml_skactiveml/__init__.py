@@ -1,8 +1,8 @@
-from .extension import SkactivemlExtension
+from .extension import SkactivemlExtension, PoolSkactivemlModel
 from openml.extensions import register_extension
 
 
-__all__ = ["SkactivemlExtension"]
+__all__ = ["SkactivemlExtension", "PoolSkactivemlModel"]
 
 register_extension(SkactivemlExtension)
 

@@ -23,6 +23,7 @@ import sklearn.base
 import sklearn.model_selection
 import sklearn.pipeline
 
+from sklearn.base import  BaseEstimator
 import openml
 from openml.exceptions import PyOpenMLError
 from openml.flows import OpenMLFlow
@@ -37,12 +38,14 @@ from openml.tasks import (
 
 logger = logging.getLogger(__name__)
 
-class PoolSkactivemlModel(sklearn.base.BaseEstimator):
+
+class PoolSkactivemlModel:
     def __init__(self, query_strategy, prediction_model, query_params, budget):
         self.query_strategy = query_strategy
         self.prediction_model = prediction_model
         self.query_params = query_params
         self.budget = budget
+
 
 class SkactivemlExtension(SklearnExtension):
     @classmethod
@@ -85,33 +88,7 @@ class SkactivemlExtension(SklearnExtension):
         -------
         bool
         """
-        if isinstance(model, dict) and len(model) == 4:
-            return (
-                isinstance(model.get('query_strategy', None), SingleAnnotatorPoolQueryStrategy)
-                and isinstance(model.get('prediction_model', None), SkactivemlClassifier)
-                and isinstance(model.get('query_params', None), (dict, type(None)))
-                and isinstance(model.get('budget', None), (int, float, type(None)))
-            )
-        return False
-
-    def is_query_strategy_model(self, model):
-        if not isinstance(model, dict):
-            return False
-        expected_keys = [
-            'query_strategy',
-            'prediction_model',
-            'query_params',
-            'budget',
-        ]
-
-        if len(model)!=len(expected_keys):
-            return False
-        
-        for expected_key in expected_keys:
-            if expected_key not in model:
-                return False
-        
-        return True
+        return isinstance(model, PoolSkactivemlModel)
 
     def model_to_flow(self, model: Any) -> "OpenMLFlow":
         """Transform a scikit-learn model to a flow for uploading it to OpenML.
@@ -124,21 +101,9 @@ class SkactivemlExtension(SklearnExtension):
         -------
         OpenMLFlow
         """
-        # Necessary to make pypy not complain about all the different possible return types
-
-        if self.is_query_strategy_model(model):
-            flow = self._serialize_sklearn(model['query_strategy'])
-
-            flow.model = OrderedDict()
-
-            flow.model['query_strategy'] = model['query_strategy']
-            flow.model['prediction_model'] = model['prediction_model']
-            flow.model['query_params'] = model['query_params']
-            flow.model['budget'] = model['budget']
-        else:
-            flow = self._serialize_sklearn(model)
-
-        return flow
+        if isinstance(model, PoolSkactivemlModel):
+            model = SkactivemlExtension._wrap_skactiveml_model(model)
+        return super().model_to_flow(model)
 
     def is_estimator(self, model: Any) -> bool:
         """Check whether the given model is a scikit-learn estimator.
@@ -154,8 +119,9 @@ class SkactivemlExtension(SklearnExtension):
         -------
         bool
         """
-        o = model
-        return (hasattr(o, "fit") or hasattr(o, "query")) and hasattr(o, "get_params") and hasattr(o, "set_params")
+        if isinstance(model, PoolSkactivemlModel):
+            model = SkactivemlExtension._wrap_skactiveml_model(model)
+        return hasattr(model, "get_params") and hasattr(model, "set_params")
 
     def check_if_model_fitted(self, model: Any) -> bool:
         """Returns True/False denoting if the model has already been fitted/trained
@@ -210,6 +176,8 @@ class SkactivemlExtension(SklearnExtension):
         def match_format(s):
             return "{}\n{}\n".format(s, len(s) * "-")
 
+        if isinstance(model, PoolSkactivemlModel):
+            model = SkactivemlExtension._wrap_skactiveml_model(model)
         s = inspect.getdoc(model)
         if s is None:
             return None
@@ -253,6 +221,8 @@ class SkactivemlExtension(SklearnExtension):
         sub_components: Dict[str, OpenMLFlow],
     ) -> str:
         import re
+        if isinstance(model, PoolSkactivemlModel):
+            model = SkactivemlExtension._wrap_skactiveml_model(model)
         externel_extension = super(). _get_external_version_string(model=model, sub_components=sub_components)
         # define the regular expression pattern
         pattern = r"(scikit-learn|sklearn)\s*([>=<~!]*\d+[.\d]*)"
@@ -287,6 +257,8 @@ class SkactivemlExtension(SklearnExtension):
         def match_format(s):
             return "{}\n{}\n".format(s, len(s) * "-")
 
+        if isinstance(model, PoolSkactivemlModel):
+            model = SkactivemlExtension._wrap_skactiveml_model(model)
         s = inspect.getdoc(model)
         if s is None:
             return ""
@@ -342,16 +314,10 @@ class SkactivemlExtension(SklearnExtension):
         -------
         Any
         """
+        if isinstance(model, PoolSkactivemlModel):
+            model = SkactivemlExtension._wrap_skactiveml_model(model)
+        return super().seed_model(model=model, seed=seed)
 
-        for k, v in model.items():
-            if k != 'query_params' and hasattr(v, "get_params") and hasattr(v, "set_params"):
-                model[k].model = super().seed_model(v, seed)
-
-        for k, v in model['query_params'].items():
-            if hasattr(v, "get_params") and hasattr(v, "set_params"):
-                model['query_params'][k] = super().seed_model(v, seed)
-
-        return model
 
     def _run_model_on_fold(
         self,
@@ -451,9 +417,9 @@ class SkactivemlExtension(SklearnExtension):
                 result.loc[obs, prediction] = 1.0
             return result
 
-        query_strategy = sklearn.base.clone(model['query_strategy'])
-        prediction_model = sklearn.base.clone(model['prediction_model'])
-        query_params = deepcopy(model['query_params'])
+        query_strategy = sklearn.base.clone(model.query_strategy)
+        prediction_model = sklearn.base.clone(model.prediction_model)
+        query_params = deepcopy(model.query_params)
 
         if isinstance(task, OpenMLSupervisedTask):
             if y_train is None:
@@ -484,7 +450,7 @@ class SkactivemlExtension(SklearnExtension):
             if isinstance(task, OpenMLActiveClassificationTask):
                 y = np.full(shape=len(y_train), fill_value=None)
                 # for c in range(model.budget):
-                max_budget = model['budget']
+                max_budget = model.budget
                 if max_budget is None:
                     max_budget = np.inf
                 cycle = 0
@@ -651,216 +617,24 @@ class SkactivemlExtension(SklearnExtension):
         flow: "OpenMLFlow",
         model: Any = None,
     ) -> List[Dict[str, Any]]:
-        parameters = super().obtain_parameter_values(flow=flow, model=model['query_strategy'])
+        if isinstance(model, PoolSkactivemlModel):
+            model = SkactivemlExtension._wrap_skactiveml_model(model)
+        parameters = super().obtain_parameter_values(flow=flow, model=model)
         return parameters
 
 
+    @classmethod
+    def _wrap_skactiveml_model(clf, model):
+        class PoolSkactivemlModel(BaseEstimator):
+            def __init__(self, query_strategy, prediction_model, query_params, budget):
+                self.query_strategy = query_strategy
+                self.prediction_model = prediction_model
+                self.query_params = query_params
+                self.budget = budget
 
-    # def obtain_parameter_values(
-    #     self,
-    #     flow: "OpenMLFlow",
-    #     model: Any = None,
-    # ) -> List[Dict[str, Any]]:
-    #     """Extracts all parameter settings required for the flow from the model.
-
-    #     If no explicit model is provided, the parameters will be extracted from `flow.model`
-    #     instead.
-
-    #     Parameters
-    #     ----------
-    #     flow : OpenMLFlow
-    #         OpenMLFlow object (containing flow ids, i.e., it has to be downloaded from the server)
-
-    #     model: Any, optional (default=None)
-    #         The model from which to obtain the parameter values. Must match the flow signature.
-    #         If None, use the model specified in ``OpenMLFlow.model``.
-
-    #     Returns
-    #     -------
-    #     list
-    #         A list of dicts, where each dict has the following entries:
-    #         - ``oml:name`` : str: The OpenML parameter name
-    #         - ``oml:value`` : mixed: A representation of the parameter value
-    #         - ``oml:component`` : int: flow id to which the parameter belongs
-    #     """
-    #     openml.flows.functions._check_flow_for_server_id(flow)
-
-    #     def get_flow_dict(_flow):
-    #         flow_map = {_flow.name: _flow.flow_id}
-    #         for subflow in _flow.components:
-    #             flow_map.update(get_flow_dict(_flow.components[subflow]))
-    #         return flow_map
-
-    #     def extract_parameters(_flow, _flow_dict, component_model, _main_call=False, main_id=None):
-    #         def is_subcomponent_specification(values):
-    #             # checks whether the current value can be a specification of
-    #             # subcomponents, as for example the value for steps parameter
-    #             # (in Pipeline) or transformers parameter (in
-    #             # ColumnTransformer). These are always lists/tuples of lists/
-    #             # tuples, size bigger than 2 and an OpenMLFlow item involved.
-    #             if not isinstance(values, (tuple, list)):
-    #                 return False
-    #             for item in values:
-    #                 if not isinstance(item, (tuple, list)):
-    #                     return False
-    #                 if len(item) < 2:
-    #                     return False
-    #                 if not isinstance(item[1], (openml.flows.OpenMLFlow, str)):
-    #                     if (
-    #                         isinstance(item[1], str)
-    #                         and item[1] in SKLEARN_PIPELINE_STRING_COMPONENTS
-    #                     ):
-    #                         pass
-    #                     else:
-    #                         return False
-    #             return True
-
-    #         # _flow is openml flow object, _param dict maps from flow name to flow
-    #         # id for the main call, the param dict can be overridden (useful for
-    #         # unit tests / sentinels) this way, for flows without subflows we do
-    #         # not have to rely on _flow_dict
-    #         exp_parameters = set(_flow.parameters)
-    #         if (
-    #             isinstance(component_model, str)
-    #             and component_model in SKLEARN_PIPELINE_STRING_COMPONENTS
-    #         ):
-    #             model_parameters = set()
-    #         else:
-    #             # model_parameters = set([mp for mp in component_model.get_params(deep=False)])
-    #             model_parameters = set([mp for mp in component_model.get_params(deep=False)])
-                
-    #         if len(exp_parameters.symmetric_difference(model_parameters)) != 0:
-    #             flow_params = sorted(exp_parameters)
-    #             model_params = sorted(model_parameters)
-    #             raise ValueError(
-    #                 "Parameters of the model do not match the "
-    #                 "parameters expected by the "
-    #                 "flow:\nexpected flow parameters: "
-    #                 "%s\nmodel parameters: %s" % (flow_params, model_params)
-    #             )
-    #         exp_components = set(_flow.components)
-    #         if (
-    #             isinstance(component_model, str)
-    #             and component_model in SKLEARN_PIPELINE_STRING_COMPONENTS
-    #         ):
-    #             model_components = set()
-    #         else:
-    #             _ = set([mp for mp in component_model.get_params(deep=False)])
-    #             model_components = set(
-    #                 [
-    #                     mp
-    #                     for mp in component_model.get_params(deep=True)
-    #                     if "__" not in mp and mp not in _
-    #                 ]
-    #             )
-    #         if len(exp_components.symmetric_difference(model_components)) != 0:
-    #             is_problem = True
-    #             if len(exp_components - model_components) > 0:
-    #                 # If an expected component is not returned as a component by get_params(),
-    #                 # this means that it is also a parameter -> we need to check that this is
-    #                 # actually the case
-    #                 difference = exp_components - model_components
-    #                 component_in_model_parameters = []
-    #                 for component in difference:
-    #                     if component in model_parameters:
-    #                         component_in_model_parameters.append(True)
-    #                     else:
-    #                         component_in_model_parameters.append(False)
-    #                 is_problem = not all(component_in_model_parameters)
-    #             if is_problem:
-    #                 flow_components = sorted(exp_components)
-    #                 model_components = sorted(model_components)
-    #                 raise ValueError(
-    #                     "Subcomponents of the model do not match the "
-    #                     "parameters expected by the "
-    #                     "flow:\nexpected flow subcomponents: "
-    #                     "%s\nmodel subcomponents: %s" % (flow_components, model_components)
-    #                 )
-
-    #         _params = []
-    #         for _param_name in _flow.parameters:
-    #             _current = OrderedDict()
-    #             _current["oml:name"] = _param_name
-
-    #             current_param_values = self.model_to_flow(component_model.get_params()[_param_name])
-
-    #             # Try to filter out components (a.k.a. subflows) which are
-    #             # handled further down in the code (by recursively calling
-    #             # this function)!
-    #             if isinstance(current_param_values, openml.flows.OpenMLFlow):
-    #                 continue
-
-    #             if is_subcomponent_specification(current_param_values):
-    #                 # complex parameter value, with subcomponents
-    #                 parsed_values = list()
-    #                 for subcomponent in current_param_values:
-    #                     # scikit-learn stores usually tuples in the form
-    #                     # (name (str), subcomponent (mixed), argument
-    #                     # (mixed)). OpenML replaces the subcomponent by an
-    #                     # OpenMLFlow object.
-    #                     if len(subcomponent) < 2 or len(subcomponent) > 3:
-    #                         raise ValueError("Component reference should be " "size {2,3}. ")
-
-    #                     subcomponent_identifier = subcomponent[0]
-    #                     subcomponent_flow = subcomponent[1]
-    #                     if not isinstance(subcomponent_identifier, str):
-    #                         raise TypeError(
-    #                             "Subcomponent identifier should be of type string, "
-    #                             "but is {}".format(type(subcomponent_identifier))
-    #                         )
-    #                     if not isinstance(subcomponent_flow, (openml.flows.OpenMLFlow, str)):
-    #                         if (
-    #                             isinstance(subcomponent_flow, str)
-    #                             and subcomponent_flow in SKLEARN_PIPELINE_STRING_COMPONENTS
-    #                         ):
-    #                             pass
-    #                         else:
-    #                             raise TypeError(
-    #                                 "Subcomponent flow should be of type flow, but is {}".format(
-    #                                     type(subcomponent_flow)
-    #                                 )
-    #                             )
-
-    #                     current = {
-    #                         "oml-python:serialized_object": COMPONENT_REFERENCE,
-    #                         "value": {
-    #                             "key": subcomponent_identifier,
-    #                             "step_name": subcomponent_identifier,
-    #                         },
-    #                     }
-    #                     if len(subcomponent) == 3:
-    #                         if not isinstance(subcomponent[2], list) and not isinstance(
-    #                             subcomponent[2], OrderedDict
-    #                         ):
-    #                             raise TypeError(
-    #                                 "Subcomponent argument should be list or OrderedDict"
-    #                             )
-    #                         current["value"]["argument_1"] = subcomponent[2]
-    #                     parsed_values.append(current)
-    #                 parsed_values = json.dumps(parsed_values)
-    #             else:
-    #                 # vanilla parameter value
-    #                 parsed_values = json.dumps(current_param_values)
-
-    #             _current["oml:value"] = parsed_values
-    #             if _main_call:
-    #                 _current["oml:component"] = main_id
-    #             else:
-    #                 _current["oml:component"] = _flow_dict[_flow.name]
-    #             _params.append(_current)
-
-    #         for _identifier in _flow.components:
-    #             subcomponent_model = component_model.get_params()[_identifier]
-    #             _params.extend(
-    #                 extract_parameters(
-    #                     _flow.components[_identifier], _flow_dict, subcomponent_model
-    #                 )
-    #             )
-    #         return _params
-
-    #     flow_dict = get_flow_dict(flow)
-    #     model = model if model is not None else flow.model
-    #     parameters = extract_parameters(flow, flow_dict, model, True, flow.flow_id)
-    #     parameters_dict = 
-
-    #     return parameters
+        return PoolSkactivemlModel(
+            query_strategy=model.query_strategy,
+            prediction_model=model.prediction_model,
+            query_params=model.query_params,
+            budget=model.budget,
+        )
