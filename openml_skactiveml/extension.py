@@ -36,15 +36,46 @@ from openml.tasks import (
     OpenMLActiveClassificationTask
 )
 
+SKLEARN_PIPELINE_STRING_COMPONENTS = ("drop", "passthrough")
+COMPONENT_REFERENCE = "component_reference"
+COMPOSITION_STEP_CONSTANT = "composition_step_constant"
+
 logger = logging.getLogger(__name__)
 
 
 class PoolSkactivemlModel:
-    def __init__(self, query_strategy, prediction_model, query_params, budget):
+    """Pool Skactiveml Model
+
+    This class implements the model that is used for an active learning 
+    experiment. It consists of the query_strategy, a prediction model,
+    a selection model (if applicable), extra query parameters and the
+    budget.
+
+    Parameters
+    ----------
+    query_strategy : skactiveml.base.SingleAnnotatorPoolQueryStrategy
+        The query strategy used for the instance selection.
+    prediction_model : skactiveml.base.SkactivemlClassifier
+        The classifier used for the evaluation.
+    selection_model : skactiveml.base.SkactivemlClassifier, optional (default=None)
+        The classifier used for the instance selection. If selection_model and selection_model_name are None, no extra parameters will be passed.
+    selection_model_name : str, optional (default=None)
+        The selection model name within `query_strategy.query`. If selection_model and selection_model_name are None, no extra parameters will be passed.
+    extra_query_params : dict-like, optional (default=None)
+        Extra parameters for `query_strategy.query`. If None, no extra parameters will be passed.
+    budget : int, default=-1
+        The maximum number of labeled instances to query. If the number is -1, all instances will be queried.
+    """
+    def __init__(self, query_strategy, prediction_model, selection_model=None, selection_model_name=None, extra_query_params=None, budget=-1):
         self.query_strategy = query_strategy
         self.prediction_model = prediction_model
-        self.query_params = query_params
+        self.selection_model = selection_model
+        self.selection_model_name = selection_model_name
+        self.extra_query_params = extra_query_params
         self.budget = budget
+
+        if (self.selection_model is None) != (self.selection_model_name is None):
+            raise ValueError(f"if `selection_model` or `selection_model_name` is None, the other has to be None, too." )
 
 
 class SkactivemlExtension(SklearnExtension):
@@ -103,7 +134,7 @@ class SkactivemlExtension(SklearnExtension):
         """
         if isinstance(model, PoolSkactivemlModel):
             model = SkactivemlExtension._wrap_skactiveml_model(model)
-        return super().model_to_flow(model)
+        return self._serialize_model(model)
 
     def is_estimator(self, model: Any) -> bool:
         """Check whether the given model is a scikit-learn estimator.
@@ -419,7 +450,13 @@ class SkactivemlExtension(SklearnExtension):
 
         query_strategy = sklearn.base.clone(model.query_strategy)
         prediction_model = sklearn.base.clone(model.prediction_model)
-        query_params = deepcopy(model.query_params)
+        selection_model = deepcopy(model.selection_model)
+        selection_model_name = deepcopy(model.selection_model_name)
+        query_params = deepcopy(model.extra_query_params)
+        if query_params is None:
+            query_params = {}
+        if selection_model is not None and selection_model_name is not None:
+            query_params[selection_model_name] = selection_model
 
         if isinstance(task, OpenMLSupervisedTask):
             if y_train is None:
@@ -451,7 +488,7 @@ class SkactivemlExtension(SklearnExtension):
                 y = np.full(shape=len(y_train), fill_value=None)
                 # for c in range(model.budget):
                 max_budget = model.budget
-                if max_budget is None:
+                if max_budget == -1:
                     max_budget = np.inf
                 cycle = 0
                 used_budget=0
@@ -626,15 +663,351 @@ class SkactivemlExtension(SklearnExtension):
     @classmethod
     def _wrap_skactiveml_model(clf, model):
         class PoolSkactivemlModel(BaseEstimator):
-            def __init__(self, query_strategy, prediction_model, query_params, budget):
+            """Pool Skactiveml Model
+
+            This class implements the model that is used for an active learning 
+            experiment. It consists of the query_strategy, a prediction model,
+            a selection model (if applicable), extra query parameters and the
+            budget.
+
+            Parameters
+            ----------
+            query_strategy : skactiveml.base.SingleAnnotatorPoolQueryStrategy
+                The query strategy used for the instance selection.
+            prediction_model : skactiveml.base.SkactivemlClassifier
+                The classifier used for the evaluation.
+            selection_model : skactiveml.base.SkactivemlClassifier, optional (default=None)
+                The classifier used for the instance selection. If selection_model and selection_model_name are None, no extra parameters will be passed.
+            selection_model_name : str, optional (default=None)
+                The selection model name within `query_strategy.query`. If selection_model and selection_model_name are None, no extra parameters will be passed.
+            extra_query_params : dict-like, optional (default=None)
+                Extra parameters for `query_strategy.query`. If None, no extra parameters will be passed.
+            budget : int, default=-1
+                The maximum number of labeled instances to query. If the number is -1, all instances will be queried.
+            """
+            def __init__(self, query_strategy, prediction_model, selection_model=None, selection_model_name=None, extra_query_params=None, budget=-1):
                 self.query_strategy = query_strategy
                 self.prediction_model = prediction_model
-                self.query_params = query_params
+                self.selection_model = selection_model
+                self.selection_model_name = selection_model_name
+                self.extra_query_params = extra_query_params
                 self.budget = budget
 
         return PoolSkactivemlModel(
             query_strategy=model.query_strategy,
             prediction_model=model.prediction_model,
-            query_params=model.query_params,
+            selection_model=model.selection_model,
+            selection_model_name=model.selection_model_name,
+            extra_query_params=model.extra_query_params,
             budget=model.budget,
         )
+
+
+    def _serialize_model(self, model: Any) -> OpenMLFlow:
+        """Create an OpenMLFlow.
+
+        Calls `sklearn_to_flow` recursively to properly serialize the
+        parameters to strings and the components (other models) to OpenMLFlows.
+
+        Parameters
+        ----------
+        model : sklearn estimator
+
+        Returns
+        -------
+        OpenMLFlow
+
+        """
+
+        # Get all necessary information about the model objects itself
+        (
+            parameters,
+            parameters_meta_info,
+            subcomponents,
+            subcomponents_explicit,
+        ) = self._extract_information_from_model(model)
+
+        # Check that a component does not occur multiple times in a flow as this
+        # is not supported by OpenML
+        self._check_multiple_occurence_of_component_in_flow(model, subcomponents)
+
+        # Create a flow name, which contains all components in brackets, e.g.:
+        # RandomizedSearchCV(Pipeline(StandardScaler,AdaBoostClassifier(DecisionTreeClassifier)),
+        # StandardScaler,AdaBoostClassifier(DecisionTreeClassifier))
+        class_name = model.__module__ + "." + model.__class__.__name__
+
+        # will be part of the name (in brackets)
+        sub_components_names = ""
+        for key in subcomponents:
+            if isinstance(subcomponents[key], OpenMLFlow):
+                name = subcomponents[key].name
+            elif (
+                isinstance(subcomponents[key], str)
+                and subcomponents[key] in SKLEARN_PIPELINE_STRING_COMPONENTS
+            ):
+                name = subcomponents[key]
+            else:
+                raise TypeError(type(subcomponents[key]))
+            if key in subcomponents_explicit:
+                sub_components_names += "," + key + "=" + name
+            else:
+                sub_components_names += "," + name
+
+        if sub_components_names:
+            # slice operation on string in order to get rid of leading comma
+            name = "%s(%s)" % (class_name, sub_components_names[1:])
+        else:
+            name = class_name
+        short_name = SklearnExtension.trim_flow_name(name)
+
+        # Get the external versions of all sub-components
+        external_version = self._get_external_version_string(model, subcomponents)
+        dependencies = self._get_dependencies()
+        tags = self._get_tags()
+
+        sklearn_description = self._get_sklearn_description(model)
+        flow = OpenMLFlow(
+            name=name,
+            class_name=class_name,
+            custom_name=short_name,
+            description=sklearn_description,
+            model=model,
+            components=subcomponents,
+            parameters=parameters,
+            parameters_meta_info=parameters_meta_info,
+            external_version=external_version,
+            tags=tags,
+            extension=self,
+            language="English",
+            dependencies=dependencies,
+        )
+
+        return flow
+
+
+    def _extract_information_from_model(
+        self,
+        model: Any,
+    ) -> Tuple[
+        "OrderedDict[str, Optional[str]]",
+        "OrderedDict[str, Optional[Dict]]",
+        "OrderedDict[str, OpenMLFlow]",
+        Set,
+    ]:
+        # This function contains four "global" states and is quite long and
+        # complicated. If it gets to complicated to ensure it's correctness,
+        # it would be best to make it a class with the four "global" states being
+        # the class attributes and the if/elif/else in the for-loop calls to
+        # separate class methods
+
+        # stores all entities that should become subcomponents
+        sub_components = OrderedDict()  # type: OrderedDict[str, OpenMLFlow]
+        # stores the keys of all subcomponents that should become
+        sub_components_explicit = set()
+        parameters = OrderedDict()  # type: OrderedDict[str, Optional[str]]
+        parameters_meta_info = OrderedDict()  # type: OrderedDict[str, Optional[Dict]]
+        parameters_docs = self._extract_sklearn_param_info(model)
+
+        model_parameters = model.get_params(deep=False)
+        for k, v in sorted(model_parameters.items(), key=lambda t: t[0]):
+            rval = self._serialize_sklearn(v, model)
+
+            def flatten_all(list_):
+                """Flattens arbitrary depth lists of lists (e.g. [[1,2],[3,[1]]] -> [1,2,3,1])."""
+                for el in list_:
+                    if isinstance(el, (list, tuple)) and len(el) > 0:
+                        yield from flatten_all(el)
+                    else:
+                        yield el
+
+            # In case rval is a list of lists (or tuples), we need to identify two situations:
+            # - sklearn pipeline steps, feature union or base classifiers in voting classifier.
+            #   They look like e.g. [("imputer", Imputer()), ("classifier", SVC())]
+            # - a list of lists with simple types (e.g. int or str), such as for an OrdinalEncoder
+            #   where all possible values for each feature are described: [[0,1,2], [1,2,5]]
+            is_non_empty_list_of_lists_with_same_type = (
+                isinstance(rval, (list, tuple))
+                and len(rval) > 0
+                and isinstance(rval[0], (list, tuple))
+                and all([isinstance(rval_i, type(rval[0])) for rval_i in rval])
+            )
+
+            # Check that all list elements are of simple types.
+            nested_list_of_simple_types = (
+                is_non_empty_list_of_lists_with_same_type
+                and all([isinstance(el, SIMPLE_TYPES) for el in flatten_all(rval)])
+                and all(
+                    [
+                        len(rv) in (2, 3) and rv[1] not in SKLEARN_PIPELINE_STRING_COMPONENTS
+                        for rv in rval
+                    ]
+                )
+            )
+
+            if is_non_empty_list_of_lists_with_same_type and not nested_list_of_simple_types:
+                # If a list of lists is identified that include 'non-simple' types (e.g. objects),
+                # we assume they are steps in a pipeline, feature union, or base classifiers in
+                # a voting classifier.
+                parameter_value = list()  # type: List
+                reserved_keywords = set(model.get_params(deep=False).keys())
+
+                for i, sub_component_tuple in enumerate(rval):
+                    identifier = sub_component_tuple[0]
+                    sub_component = sub_component_tuple[1]
+                    sub_component_type = type(sub_component_tuple)
+                    if not 2 <= len(sub_component_tuple) <= 3:
+                        # length 2 is for {VotingClassifier.estimators,
+                        # Pipeline.steps, FeatureUnion.transformer_list}
+                        # length 3 is for ColumnTransformer
+                        msg = "Length of tuple of type {} does not match assumptions".format(
+                            sub_component_type
+                        )
+                        raise ValueError(msg)
+
+                    if isinstance(sub_component, str):
+                        if sub_component not in SKLEARN_PIPELINE_STRING_COMPONENTS:
+                            msg = (
+                                "Second item of tuple does not match assumptions. "
+                                "If string, can be only 'drop' or 'passthrough' but"
+                                "got %s" % sub_component
+                            )
+                            raise ValueError(msg)
+                        else:
+                            pass
+                    elif isinstance(sub_component, type(None)):
+                        msg = (
+                            "Cannot serialize objects of None type. Please use a valid "
+                            "placeholder for None. Note that empty sklearn estimators can be "
+                            "replaced with 'drop' or 'passthrough'."
+                        )
+                        raise ValueError(msg)
+                    elif not isinstance(sub_component, OpenMLFlow):
+                        msg = (
+                            "Second item of tuple does not match assumptions. "
+                            "Expected OpenMLFlow, got %s" % type(sub_component)
+                        )
+                        raise TypeError(msg)
+
+                    if identifier in reserved_keywords:
+                        parent_model = "{}.{}".format(model.__module__, model.__class__.__name__)
+                        msg = "Found element shadowing official " "parameter for %s: %s" % (
+                            parent_model,
+                            identifier,
+                        )
+                        raise PyOpenMLError(msg)
+
+                    # when deserializing the parameter
+                    sub_components_explicit.add(identifier)
+                    if isinstance(sub_component, str):
+
+                        external_version = self._get_external_version_string(None, {})
+                        dependencies = self._get_dependencies()
+                        tags = self._get_tags()
+
+                        sub_components[identifier] = OpenMLFlow(
+                            name=sub_component,
+                            description="Placeholder flow for scikit-learn's string pipeline "
+                            "members",
+                            components=OrderedDict(),
+                            parameters=OrderedDict(),
+                            parameters_meta_info=OrderedDict(),
+                            external_version=external_version,
+                            tags=tags,
+                            language="English",
+                            dependencies=dependencies,
+                            model=None,
+                        )
+                        component_reference = OrderedDict()  # type: Dict[str, Union[str, Dict]]
+                        component_reference[
+                            "oml-python:serialized_object"
+                        ] = COMPOSITION_STEP_CONSTANT
+                        cr_value = OrderedDict()  # type: Dict[str, Any]
+                        cr_value["key"] = identifier
+                        cr_value["step_name"] = identifier
+                        if len(sub_component_tuple) == 3:
+                            cr_value["argument_1"] = sub_component_tuple[2]
+                        component_reference["value"] = cr_value
+                    else:
+                        sub_components[identifier] = sub_component
+                        component_reference = OrderedDict()
+                        component_reference["oml-python:serialized_object"] = COMPONENT_REFERENCE
+                        cr_value = OrderedDict()
+                        cr_value["key"] = identifier
+                        cr_value["step_name"] = identifier
+                        if len(sub_component_tuple) == 3:
+                            cr_value["argument_1"] = sub_component_tuple[2]
+                        component_reference["value"] = cr_value
+                    parameter_value.append(component_reference)
+
+                # Here (and in the elif and else branch below) are the only
+                # places where we encode a value as json to make sure that all
+                # parameter values still have the same type after
+                # deserialization
+                if isinstance(rval, tuple):
+                    parameter_json = json.dumps(tuple(parameter_value))
+                else:
+                    parameter_json = json.dumps(parameter_value)
+                parameters[k] = parameter_json
+
+            elif isinstance(rval, OpenMLFlow):
+
+                # A subcomponent, for example the base model in
+                # AdaBoostClassifier
+                sub_components[k] = rval
+                sub_components_explicit.add(k)
+                component_reference = OrderedDict()
+                component_reference["oml-python:serialized_object"] = COMPONENT_REFERENCE
+                cr_value = OrderedDict()
+                cr_value["key"] = k
+                cr_value["step_name"] = None
+                component_reference["value"] = cr_value
+                cr = self._serialize_sklearn(component_reference, model)
+                parameters[k] = json.dumps(cr)
+
+            # elif isinstance(rval, OrderedDict):
+            #     o = OrderedDict()
+            #     for dict_key, dict_value in rval.items():
+            #         dict_key = self._serialize_sklearn(dict_key)
+            #         dict_value = self._serialize_sklearn(dict_value)
+            #         o[dict_key]=dict_value
+            else:
+                # a regular hyperparameter
+                if not (hasattr(rval, "__len__") and len(rval) == 0):
+                    rval = json.dumps(rval)
+                    parameters[k] = rval
+                else:
+                    parameters[k] = None
+
+            if parameters_docs is not None:
+                data_type, description = parameters_docs[k]
+                parameters_meta_info[k] = OrderedDict(
+                    (("description", description), ("data_type", data_type))
+                )
+            else:
+                parameters_meta_info[k] = OrderedDict((("description", None), ("data_type", None)))
+
+        return parameters, parameters_meta_info, sub_components, sub_components_explicit
+    
+    
+    def _check_multiple_occurence_of_component_in_flow(
+        self,
+        model: Any,
+        sub_components: Dict[str, OpenMLFlow],
+    ) -> None:
+        # to_visit_stack = []  # type: List[OpenMLFlow]
+        # to_visit_stack.extend(sub_components.values())
+        # known_sub_components = set()  # type: Set[str]
+
+        # while len(to_visit_stack) > 0:
+        #     visitee = to_visit_stack.pop()
+        #     if isinstance(visitee, str) and visitee in SKLEARN_PIPELINE_STRING_COMPONENTS:
+        #         known_sub_components.add(visitee)
+        #     elif visitee.name in known_sub_components:
+        #         raise ValueError(
+        #             "Found a second occurence of component %s when "
+        #             "trying to serialize %s." % (visitee.name, model)
+        #         )
+        #     else:
+        #         known_sub_components.add(visitee.name)
+        #         to_visit_stack.extend(visitee.components.values())
+        pass
