@@ -134,7 +134,7 @@ class SkactivemlExtension(SklearnExtension):
         """
         if isinstance(model, PoolSkactivemlModel):
             model = SkactivemlExtension._wrap_skactiveml_model(model)
-        return self._serialize_model(model)
+        return self._serialize_sklearn(model)
 
     def is_estimator(self, model: Any) -> bool:
         """Check whether the given model is a scikit-learn estimator.
@@ -504,7 +504,7 @@ class SkactivemlExtension(SklearnExtension):
                         used_budget = used_budget + annotation_costs[query_idx].item()
 
                     budget_t.append(used_budget)
-                    queries_t.append(query_idxs)
+                    queries_t.append(query_idxs.tolist())
 
                     prediction_model.fit(X_train, y)
 
@@ -517,7 +517,7 @@ class SkactivemlExtension(SklearnExtension):
                     else:
                         model_classes = used_estimator.classes_
 
-                    pred_t.append(prediction_model.predict(X_test))
+                    pred_t.append(prediction_model.predict(X_test).tolist())
                     proba_t_raw = prediction_model.predict_proba(X_test)
                     proba_t_df = pd.DataFrame(proba_t_raw, columns=model_classes)
                     for _, col in enumerate(task.class_labels):
@@ -525,7 +525,7 @@ class SkactivemlExtension(SklearnExtension):
                         if col not in model_classes:
                             proba_t_df[col] = 0
                     proba_t_df = proba_t_df[task.class_labels]
-                    proba_t.append(proba_t_df)
+                    proba_t.append(proba_t_df.values.tolist())
 
                     cycle += 1
 
@@ -534,9 +534,9 @@ class SkactivemlExtension(SklearnExtension):
             modelfit_dur_cputime = (time.process_time() - modelfit_start_cputime) * 1000
             modelfit_dur_walltime = (time.time() - modelfit_start_walltime) * 1000
 
-            user_defined_measures['budget_t'] = np.array(budget_t)
-            user_defined_measures['queries_t'] = np.array(queries_t)
-            user_defined_measures['pred_t'] = np.array(pred_t)
+            user_defined_measures['budget_t'] = budget_t
+            user_defined_measures['queries_t'] = queries_t
+            user_defined_measures['pred_t'] = pred_t
             user_defined_measures['proba_t'] = proba_t
 
             user_defined_measures["usercpu_time_millis_training"] = modelfit_dur_cputime
