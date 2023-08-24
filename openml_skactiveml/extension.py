@@ -685,7 +685,7 @@ class SkactivemlExtension(SklearnExtension):
             budget : int, default=-1
                 The maximum number of labeled instances to query. If the number is -1, all instances will be queried.
             """
-            def __init__(self, query_strategy, prediction_model, selection_model=None, selection_model_name=None, extra_query_params=None, budget=-1):
+            def __init__(self, query_strategy, prediction_model, selection_model, selection_model_name, extra_query_params, budget):
                 self.query_strategy = query_strategy
                 self.prediction_model = prediction_model
                 self.selection_model = selection_model
