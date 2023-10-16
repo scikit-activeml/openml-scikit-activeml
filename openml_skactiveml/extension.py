@@ -36,11 +36,40 @@ from openml.tasks import (
     OpenMLActiveClassificationTask
 )
 
+from collections.abc import Iterable
+
+import sys
+if sys.version_info >= (3, 5):
+    from json.decoder import JSONDecodeError
+else:
+    JSONDecodeError = ValueError
+
 SKLEARN_PIPELINE_STRING_COMPONENTS = ("drop", "passthrough")
 COMPONENT_REFERENCE = "component_reference"
 COMPOSITION_STEP_CONSTANT = "composition_step_constant"
 
 logger = logging.getLogger(__name__)
+
+
+def check_skactiveml_params(object, param_name, param_value):
+    if not isinstance(object, (SkactivemlClassifier, SingleAnnotatorPoolQueryStrategy)):
+        return
+    attributes = dir(object)
+    for attr_name in attributes:
+        if hasattr(object, attr_name):
+            value = getattr(object, attr_name)
+            if attr_name == param_name:
+                if getattr(object, param_name) is not None:
+                    raise ValueError(f'An object of type `{type(object)}` has `{param_name}` that are not set to `None`.')
+                setattr(object, param_name, param_value)
+            elif isinstance(value, (SkactivemlClassifier, SingleAnnotatorPoolQueryStrategy)):
+                check_skactiveml_params(value, param_name, param_value)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    check_skactiveml_params(item, param_name, param_value)
+            elif isinstance(value, Iterable):
+                for item in value:
+                    check_skactiveml_params(item, param_name, param_value)
 
 
 class PoolSkactivemlModel:
@@ -75,8 +104,16 @@ class PoolSkactivemlModel:
         self.budget = budget
 
         if (self.selection_model is None) != (self.selection_model_name is None):
-            raise ValueError(f"if `selection_model` or `selection_model_name` is None, the other has to be None, too." )
+            raise ValueError(f"if `selection_model` or `selection_model_name` is None, the other has to be `None`, too." )
+        
+        estimators_to_check = [query_strategy, prediction_model, selection_model]
+        if extra_query_params:
+            estimators_to_check += list(extra_query_params.values())
 
+        for estimator in estimators_to_check:
+            check_skactiveml_params(estimator, 'classes', None)
+            check_skactiveml_params(estimator, 'missing_label', None)
+                
 
 class SkactivemlExtension(SklearnExtension):
     @classmethod
@@ -97,15 +134,17 @@ class SkactivemlExtension(SklearnExtension):
 
     @classmethod
     def _is_skactiveml_flow(cls, flow: OpenMLFlow) -> bool:
-        if getattr(flow, "dependencies", None) is not None and "skactiveml" in flow.dependencies:
-            return True
-        if flow.external_version is None:
-            return False
-        else:
-            return (
-                flow.external_version.startswith("skactiveml==")
-                or ",skactiveml==" in flow.external_version
-            )
+        if not "sklearn" in flow.dependencies:
+            if getattr(flow, "dependencies", None) is not None and "skactiveml" in flow.dependencies:
+                return True
+            if flow.external_version is None:
+                return False
+            else:
+                return (
+                    flow.external_version.startswith("skactiveml==")
+                    or ",skactiveml==" in flow.external_version
+                )
+        return False
 
     @classmethod
     def can_handle_model(cls, model: Any) -> bool:
@@ -349,7 +388,6 @@ class SkactivemlExtension(SklearnExtension):
             model = SkactivemlExtension._wrap_skactiveml_model(model)
         return super().seed_model(model=model, seed=seed)
 
-
     def _run_model_on_fold(
         self,
         model: Any,
@@ -463,6 +501,11 @@ class SkactivemlExtension(SklearnExtension):
                 raise TypeError("argument y_train must not be of type None")
             if X_test is None:
                 raise TypeError("argument X_test must not be of type None")
+
+        # replace classes
+        estimators_to_check = [query_strategy, prediction_model, selection_model] + list(query_params.values())
+        for estimator in estimators_to_check:
+            check_skactiveml_params(estimator, 'classes', task.class_labels)
 
         # sanity check: prohibit users from optimizing n_jobs
         self._prevent_optimize_n_jobs(prediction_model)
@@ -1011,3 +1054,159 @@ class SkactivemlExtension(SklearnExtension):
         #         known_sub_components.add(visitee.name)
         #         to_visit_stack.extend(visitee.components.values())
         pass
+
+    def _deserialize_sklearn(
+        self,
+        o: Any,
+        components: Optional[Dict] = None,
+        initialize_with_defaults: bool = False,
+        recursion_depth: int = 0,
+        strict_version: bool = True,
+    ) -> Any:
+        """Recursive function to deserialize a scikit-learn flow.
+
+        This function inspects an object to deserialize and decides how to do so. This function
+        delegates all work to the respective functions to deserialize special data structures etc.
+        This function works on everything that has been serialized to OpenML: OpenMLFlow,
+        components (which are flows themselves), functions, hyperparameter distributions (for
+        random search) and the actual hyperparameter values themselves.
+
+        Parameters
+        ----------
+        o : mixed
+            the object to deserialize (can be flow object, or any serialized
+            parameter value that is accepted by)
+
+        components : Optional[dict]
+            Components of the current flow being de-serialized. These will not be used when
+            de-serializing the actual flow, but when de-serializing a component reference.
+
+        initialize_with_defaults : bool, optional (default=False)
+            If this flag is set, the hyperparameter values of flows will be
+            ignored and a flow with its defaults is returned.
+
+        recursion_depth : int
+            The depth at which this flow is called, mostly for debugging
+            purposes
+
+        strict_version : bool, default=True
+            Whether to fail if version requirements are not fulfilled.
+
+        Returns
+        -------
+        mixed
+        """
+
+        logger.info(
+            "-%s flow_to_sklearn START o=%s, components=%s, init_defaults=%s"
+            % ("-" * recursion_depth, o, components, initialize_with_defaults)
+        )
+        depth_pp = recursion_depth + 1  # shortcut var, depth plus plus
+
+        # First, we need to check whether the presented object is a json string.
+        # JSON strings are used to encoder parameter values. By passing around
+        # json strings for parameters, we make sure that we can flow_to_sklearn
+        # the parameter values to the correct type.
+
+        if isinstance(o, str):
+            try:
+                o = json.loads(o)
+            except JSONDecodeError:
+                pass
+
+        if isinstance(o, dict):
+            # Check if the dict encodes a 'special' object, which could not
+            # easily converted into a string, but rather the information to
+            # re-create the object were stored in a dictionary.
+            if "oml-python:serialized_object" in o:
+                serialized_type = o["oml-python:serialized_object"]
+                value = o["value"]
+                if serialized_type == "type":
+                    rval = self._deserialize_type(value)
+                elif serialized_type == "rv_frozen":
+                    rval = self._deserialize_rv_frozen(value)
+                elif serialized_type == "function":
+                    rval = self._deserialize_function(value)
+                elif serialized_type in (COMPOSITION_STEP_CONSTANT, COMPONENT_REFERENCE):
+                    if serialized_type == COMPOSITION_STEP_CONSTANT:
+                        pass
+                    elif serialized_type == COMPONENT_REFERENCE:
+                        value = self._deserialize_sklearn(
+                            value, recursion_depth=depth_pp, strict_version=strict_version
+                        )
+                    else:
+                        raise NotImplementedError(serialized_type)
+                    assert components is not None  # Necessary for mypy
+                    step_name = value["step_name"]
+                    key = value["key"]
+                    component = self._deserialize_sklearn(
+                        components[key],
+                        initialize_with_defaults=initialize_with_defaults,
+                        recursion_depth=depth_pp,
+                        strict_version=strict_version,
+                    )
+                    # The component is now added to where it should be used
+                    # later. It should not be passed to the constructor of the
+                    # main flow object.
+                    del components[key]
+                    if step_name is None:
+                        rval = component
+                    elif "argument_1" not in value:
+                        rval = (step_name, component)
+                    else:
+                        rval = (step_name, component, value["argument_1"])
+                elif serialized_type == "cv_object":
+                    rval = self._deserialize_cross_validator(
+                        value, recursion_depth=recursion_depth, strict_version=strict_version
+                    )
+                else:
+                    raise ValueError("Cannot flow_to_sklearn %s" % serialized_type)
+
+            else:
+                rval = OrderedDict(
+                    (
+                        self._deserialize_sklearn(
+                            o=key,
+                            components=components,
+                            initialize_with_defaults=initialize_with_defaults,
+                            recursion_depth=depth_pp,
+                            strict_version=strict_version,
+                        ),
+                        self._deserialize_sklearn(
+                            o=value,
+                            components=components,
+                            initialize_with_defaults=initialize_with_defaults,
+                            recursion_depth=depth_pp,
+                            strict_version=strict_version,
+                        ),
+                    )
+                    for key, value in sorted(o.items())
+                )
+        elif isinstance(o, (list, tuple)):
+            rval = [
+                self._deserialize_sklearn(
+                    o=element,
+                    components=components,
+                    initialize_with_defaults=initialize_with_defaults,
+                    recursion_depth=depth_pp,
+                    strict_version=strict_version,
+                )
+                for element in o
+            ]
+            if isinstance(o, tuple):
+                rval = tuple(rval)
+        elif isinstance(o, (bool, int, float, str)) or o is None:
+            rval = o
+        elif isinstance(o, OpenMLFlow):
+            if not self._is_skactiveml_flow(o):
+                raise ValueError("Only sklearn flows can be reinstantiated")
+            rval = self._deserialize_model(
+                flow=o,
+                keep_defaults=initialize_with_defaults,
+                recursion_depth=recursion_depth,
+                strict_version=strict_version,
+            )
+        else:
+            raise TypeError(o)
+        logger.info("-%s flow_to_sklearn END   o=%s, rval=%s" % ("-" * recursion_depth, o, rval))
+        return rval
