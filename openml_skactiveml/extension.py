@@ -67,7 +67,7 @@ def check_skactiveml_params(object, param_name, param_value):
             elif isinstance(value, dict):
                 for item in value.values():
                     check_skactiveml_params(item, param_name, param_value)
-            elif isinstance(value, Iterable):
+            elif isinstance(value, list):
                 for item in value:
                     check_skactiveml_params(item, param_name, param_value)
 
@@ -134,16 +134,15 @@ class SkactivemlExtension(SklearnExtension):
 
     @classmethod
     def _is_skactiveml_flow(cls, flow: OpenMLFlow) -> bool:
-        if not "sklearn" in flow.dependencies:
-            if getattr(flow, "dependencies", None) is not None and "skactiveml" in flow.dependencies:
-                return True
-            if flow.external_version is None:
-                return False
-            else:
-                return (
-                    flow.external_version.startswith("skactiveml==")
-                    or ",skactiveml==" in flow.external_version
-                )
+        if getattr(flow, "dependencies", None) is not None and "skactiveml" in flow.dependencies:
+            return True
+        if flow.external_version is None:
+            return False
+        else:
+            return (
+                flow.external_version.startswith("skactiveml==")
+                or ",skactiveml==" in flow.external_version
+            )
         return False
 
     @classmethod
@@ -278,11 +277,11 @@ class SkactivemlExtension(SklearnExtension):
         import re
         dependencies = self._min_dependency_str(sklearn.__version__)
         # define the regular expression pattern
-        pattern = r"(scikit-learn|sklearn)\s*([>=<~!]*\d+[.\d]*)\n"
+        # pattern = r"(scikit-learn|sklearn)\s*([>=<~!]*\d+[.\d]*)\n"
 
         # substitute the version number with "new_version"
-        dependencies = re.sub(pattern, "", dependencies)
-        print(dependencies)
+        # dependencies = re.sub(pattern, "", dependencies)
+        # print(dependencies)
         return dependencies
 
     def _get_external_version_string(
@@ -295,11 +294,11 @@ class SkactivemlExtension(SklearnExtension):
             model = SkactivemlExtension._wrap_skactiveml_model(model)
         externel_extension = super(). _get_external_version_string(model=model, sub_components=sub_components)
         # define the regular expression pattern
-        pattern = r"(scikit-learn|sklearn)\s*([>=<~!]*\d+[.\d]*)"
+        # pattern = r"(scikit-learn|sklearn)\s*([>=<~!]*\d+[.\d]*)"
 
         # substitute the version number with "new_version"
-        externel_extension = re.sub(pattern, "", externel_extension)
-        print(externel_extension)
+        # externel_extension = re.sub(pattern, "", externel_extension)
+        # print(externel_extension)
         return externel_extension
 
     def _get_sklearn_description(self, model: Any, char_lim: int = 1024) -> str:
@@ -1199,7 +1198,7 @@ class SkactivemlExtension(SklearnExtension):
         elif isinstance(o, (bool, int, float, str)) or o is None:
             rval = o
         elif isinstance(o, OpenMLFlow):
-            if not self._is_skactiveml_flow(o):
+            if (not self._is_skactiveml_flow(o)) and (not SklearnExtension._is_sklearn_flow(o)):
                 raise ValueError("Only sklearn flows can be reinstantiated")
             rval = self._deserialize_model(
                 flow=o,
