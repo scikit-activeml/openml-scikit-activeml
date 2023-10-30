@@ -503,7 +503,8 @@ class SkactivemlExtension(SklearnExtension):
                 raise TypeError("argument X_test must not be of type None")
 
         # replace classes
-        estimators_to_check = [query_strategy, prediction_model, selection_model] + list(query_params.values())
+        # selection model is implicitely contained in query_params
+        estimators_to_check = [query_strategy, prediction_model] + list(query_params.values())
         for estimator in estimators_to_check:
             check_skactiveml_params(estimator, 'classes', task.class_labels)
 
